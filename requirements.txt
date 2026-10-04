@@ -1,0 +1,8 @@
+streamlit==1.35.0
+torch==2.3.0
+torchvision==0.18.0
+Pillow
+numpy
+scikit-learn
+datasets
+huggingface_hub
