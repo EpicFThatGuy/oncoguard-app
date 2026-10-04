@@ -7,219 +7,292 @@ import os
 import time
 import uuid
 import pandas as pd
+import numpy as np
+import json
 import hashlib
 
-from model_architecture import DualBackboneOncoGuard, CalibratedInferenceEngine
+from model_architecture import (
+    ConvNeXtClinicalExtractor,
+    ClinicalImageProcessor,
+    RadiomicPhysicsEngine,
+    ClinicalReferenceBank
+)
 
-# Page Layout Setup
-st.set_page_config(page_title="OncoGuard AI - Medical Triage Workspace", layout="wide", page_icon="🩺")
+# =========================================================================
+# 1. ENTERPRISE PACS THEME & LAYOUT CONFIGURATION
+# =========================================================================
+st.set_page_config(
+    page_title="OncoGuard Enterprise PACS Workspace",
+    layout="wide",
+    page_icon="🎗️",
+    initial_sidebar_state="expanded"
+)
 
-# System Paths & Constants
+# Hospital Workstation Dark-Mode CSS Styling
+st.markdown("""
+<style>
+    .main { background-color: #0b0e14; color: #e6edf3; }
+    .stMetric { background-color: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 8px; }
+    div[data-testid="stExpander"] { background-color: #161b22; border: 1px solid #30363d; }
+    .badge-critical { background-color: #b91c1c; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+    .badge-urgent { background-color: #b45309; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+    .badge-routine { background-color: #15803d; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+</style>
+""", unsafe_allow_html=True)
+
+# Directory Structure Initialization
 BASE_DIR = os.getcwd()
-DB_PATH = os.path.join(BASE_DIR, "system_records.db")
-SCANS_DIR = os.path.join(BASE_DIR, "patient_scans")
+DB_PATH = os.path.join(BASE_DIR, "clinical_pacs.db")
+SCANS_DIR = os.path.join(BASE_DIR, "patient_repository")
 os.makedirs(SCANS_DIR, exist_ok=True)
 
-# Hash password helper
-def hash_pass(password):
+def hash_token(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# Database Initialization with Explicit Schema Safeguards
-def init_db():
+# =========================================================================
+# 2. DATABASE LAYER WITH MIGRATION SAFEGUARDS
+# =========================================================================
+def init_pacs_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # Users Table
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-                    username TEXT PRIMARY KEY, 
-                    password TEXT NOT NULL, 
-                    role TEXT NOT NULL)''')
-    
-    # Scans Table
-    c.execute('''CREATE TABLE IF NOT EXISTS scans (
-                    scan_id TEXT PRIMARY KEY, 
-                    patient_id TEXT NOT NULL, 
-                    uploaded_by TEXT NOT NULL, 
-                    risk_score REAL NOT NULL, 
-                    priority TEXT NOT NULL, 
-                    pathology_type TEXT NOT NULL, 
-                    birads_category TEXT NOT NULL, 
-                    file_path TEXT NOT NULL, 
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    # 1. Clinician Authentication Registry
+    c.execute('''CREATE TABLE IF NOT EXISTS clinicians (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    institution TEXT NOT NULL)''')
                     
-    # Default Admin User
-    admin_hash = hash_pass("admin123")
-    c.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES ('admin', ?, 'Admin')", (admin_hash,))
+    # 2. PACS Diagnostic Scans & Audit Warehouse
+    c.execute('''CREATE TABLE IF NOT EXISTS pacs_scans (
+                    scan_id TEXT PRIMARY KEY,
+                    patient_id TEXT NOT NULL,
+                    clinician_user TEXT NOT NULL,
+                    risk_score REAL NOT NULL,
+                    priority_tier TEXT NOT NULL,
+                    birads_classification TEXT NOT NULL,
+                    pathology_subtype TEXT NOT NULL,
+                    matched_reference_id TEXT NOT NULL,
+                    image_storage_path TEXT NOT NULL,
+                    embedding_payload TEXT NOT NULL,
+                    confirmed_ground_truth TEXT DEFAULT 'UNVERIFIED',
+                    ingest_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+
+    # Seed Default Master Oncologist Account
+    master_pass = hash_token("admin123")
+    c.execute("""INSERT OR IGNORE INTO clinicians (username, password_hash, role, institution) 
+                 VALUES ('admin', ?, 'Chief Radiologist', 'Global Oncology Triage Hub')""", (master_pass,))
     
     conn.commit()
     conn.close()
 
-init_db()
+init_pacs_db()
 
-# Model Architecture Loader
+# =========================================================================
+# 3. RESOURCE CACHING: DEEP MODELS & REFERENCE REPOSITORIES
+# =========================================================================
 @st.cache_resource
-def load_oncology_engine():
-    model = DualBackboneOncoGuard(pretrained=True)
-    engine = CalibratedInferenceEngine(model=model)
-    return engine
+def load_system_engines():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    extractor = ConvNeXtClinicalExtractor().to(device).eval()
+    ref_bank = ClinicalReferenceBank(extractor, device)
+    
+    # Hydrate reference bank from verified historical database entries
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT scan_id, embedding_payload, confirmed_ground_truth, pathology_subtype, birads_classification 
+                 FROM pacs_scans WHERE confirmed_ground_truth IN ('MALIGNANT', 'BENIGN')""")
+    rows = c.fetchall()
+    conn.close()
+    
+    for sid, emb_json, gt, path, bi in rows:
+        try:
+            vec = json.loads(emb_json)
+            ref_bank.register_case(sid, vec, gt, path, bi, "User-confirmed clinical ground truth")
+        except Exception:
+            continue
+            
+    return extractor, ref_bank, device
 
-engine = load_oncology_engine()
+extractor, ref_bank, device = load_system_engines()
 
-# Transform Pipeline for Mammogram Ingestion
-transform = transforms.Compose([
+tensor_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# Authentication Session State
+# =========================================================================
+# 4. CLINICIAN ACCESS CONTROL GATEWAY
+# =========================================================================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.username = None
+    st.session_state.role = None
 
-# Authentication Gateway
 if not st.session_state.authenticated:
-    st.title("🩺 OncoGuard Enterprise Clinical Portal")
-    st.subheader("Secure Oncology Diagnostic Terminal")
+    st.title("🛡️ OncoGuard Enterprise PACS Terminal")
+    st.caption("Clinical-Grade Mammography Triage & Deep Reference Matcher")
     
-    with st.form("login_form"):
-        username = st.text_input("Clinician Username")
-        password = st.text_input("Password", type="password")
-        submit = st.form_submit_button("Authenticate")
-        
-        if submit:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("SELECT password FROM users WHERE username = ?", (username,))
-            row = c.fetchone()
-            conn.close()
+    col_l1, col_l2 = st.columns([1, 1])
+    with col_l1:
+        with st.form("auth_form"):
+            st.subheader("Secure Practitioner Terminal Access")
+            u = st.text_input("Practitioner ID / Username")
+            p = st.text_input("Access Password", type="password")
+            auth_btn = st.form_submit_button("Verify Identification", use_container_width=True)
             
-            if row and row[0] == hash_pass(password):
-                st.session_state.authenticated = True
-                st.session_state.username = username
-                st.success("Authenticated successfully.")
-                st.rerun()
-            else:
-                st.error("Invalid credentials. (Default: admin / admin123)")
+            if auth_btn:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT password_hash, role FROM clinicians WHERE username = ?", (u,))
+                row = c.fetchone()
+                conn.close()
+                
+                if row and row[0] == hash_token(p):
+                    st.session_state.authenticated = True
+                    st.session_state.username = u
+                    st.session_state.role = row[1]
+                    st.success("Identity verified. Initializing workstation...")
+                    st.rerun()
+                else:
+                    st.error("Authentication failed. (Default: admin / admin123)")
     st.stop()
 
-# Header Toolbar
-col_title, col_user = st.columns([4, 1])
-with col_title:
-    st.title("🎗️ OncoGuard AI Workspace")
-    st.caption("Deep Learning Mammography Triage & Pathology Prioritization System")
-with col_user:
-    st.write(f"Logged in: **{st.session_state.username}**")
-    if st.button("Log Out"):
+# =========================================================================
+# 5. WORKSTATION TOP BAR & NAVIGATION
+# =========================================================================
+header_c1, header_c2 = st.columns([4, 1])
+with header_c1:
+    st.title("🩺 OncoGuard PACS Workspace")
+    st.caption(f"Authenticated Practitioner: **{st.session_state.username}** | Status: **{st.session_state.role}** | Reference Bank: **{len(ref_bank.reference_cases)} Clinical Archetypes Active**")
+with header_c2:
+    if st.button("Terminate Session", use_container_width=True):
         st.session_state.authenticated = False
         st.rerun()
 
 st.divider()
 
-# Navigation Tabs
-tab_scan, tab_workplace = st.tabs(["🔬 Run Scan Diagnostic", "📋 Workplace Prioritization Board"])
+nav_tabs = st.tabs(["🔬 Patient Scan Ingestion", "📋 Urgent Worklist Queue", "🧠 Clinical Feedback & Active Memory"])
 
-# -------------------------------------------------------------
-# TAB 1: RUN SCAN DIAGNOSTIC
-# -------------------------------------------------------------
-with tab_scan:
-    st.header("New Patient Diagnostic Ingestion")
+# =========================================================================
+# TAB 1: SCAN INGESTION, PACS VIEWING & RADIOMIC EVALUATION
+# =========================================================================
+with nav_tabs[0]:
+    st.header("Mammography Acquisition & Multi-Spectral Diagnostic View")
     
-    col_input, col_preview = st.columns([1, 1])
+    col_up, col_info = st.columns([1, 2])
     
-    with col_input:
-        patient_id = st.text_input("Patient Reference ID", placeholder="e.g. PT-90821")
-        uploaded_file = st.file_uploader("Upload Digital Mammogram (JPG / PNG)", type=["jpg", "png", "jpeg"])
-        run_btn = st.button("🚀 Execute Clinical Analysis", use_container_width=True)
-    
-    if run_btn:
-        if not patient_id or not uploaded_file:
-            st.warning("Please provide both a Patient Reference ID and a valid DICOM/Image scan.")
-        else:
-            # Generate Unique Storage Path & Unique Primary Key
-            unique_scan_id = f"SCAN_{patient_id}_{int(time.time())}_{uuid.uuid4().hex[:4]}"
-            file_path = os.path.join(SCANS_DIR, f"{unique_scan_id}.png")
+    with col_up:
+        in_patient_id = st.text_input("Patient Identifier / Barcode Reference", placeholder="e.g. PT-99082")
+        uploaded_file = st.file_uploader("Upload Digital Mammogram (DICOM / High-Res PNG / JPG)", type=["png", "jpg", "jpeg"])
+        run_inference = st.button("🚀 Execute Comprehensive Analysis", use_container_width=True)
+
+    if uploaded_file and in_patient_id:
+        # Load raw file
+        raw_pil = Image.open(uploaded_file)
+        
+        # 1. Execute Breast ROI Segmentation
+        cropped_tissue = ClinicalImageProcessor.crop_to_breast_tissue(raw_pil)
+        
+        # 2. Generate PACS Multimodal Viewing Presets
+        views = ClinicalImageProcessor.generate_view_presets(cropped_tissue)
+        
+        with col_info:
+            view_mode = st.radio("PACS Window Preset:", ["Standard", "CLAHE Enhanced", "Inverted Film", "Calcification Focus"], horizontal=True)
+            st.image(views[view_mode], caption=f"Patient {in_patient_id} - Mode: {view_mode}", use_container_width=True)
             
-            # Save Image Locally
-            image = Image.open(uploaded_file).convert("RGB")
-            image.save(file_path)
-            
-            with col_preview:
-                st.image(image, caption=f"Uploaded Scan: {patient_id}", use_column_width=True)
-            
-            # Run Inference Pipeline
-            with st.spinner("Processing Dual-Backbone Feature Extractor & Platt Calibration..."):
-                input_tensor = transform(image).unsqueeze(0)
-                result = engine.predict(input_tensor)
+        if run_inference:
+            with st.spinner("Extracting ConvNeXt Embeddings & Computing Reference Matrix..."):
+                # Prepare Tensor
+                input_tensor = tensor_transform(views["Standard"]).unsqueeze(0).to(device)
                 
-            risk_pct = result["calibrated_probability"]
-            priority = result["priority_code"]
-            sla = result["target_sla"]
-            birads = result["birads_category"]
-            pathology = result["pathology_type"]
-            clinical_note = result["clinical_note"]
-            
-            # Safe Database Insertion with Unique ID & Explicit Columns
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("""INSERT INTO scans (scan_id, patient_id, uploaded_by, risk_score, priority, pathology_type, birads_category, file_path) 
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                      (unique_scan_id, patient_id, st.session_state.username, risk_pct, priority, pathology, birads, file_path))
-            conn.commit()
-            conn.close()
-            
-            # Display Clinical Results Card
-            st.divider()
-            st.subheader("📊 AI Diagnostic Output")
-            
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Malignancy Risk", f"{risk_pct}%")
-            m2.metric("Triage Priority Tier", priority.split(":")[0])
-            m3.metric("Target Clinical SLA", sla)
-            
-            if "DEFINITIVE MALIGNANCY" in priority:
-                st.error(f"**Pathology Classification:** {pathology}")
-                st.error(f"**BI-RADS Classification:** {birads}")
-                st.error(f"**Clinical Action Note:** {clinical_note}")
-            elif "SUSPICIOUS" in priority:
-                st.warning(f"**Pathology Classification:** {pathology}")
-                st.warning(f"**BI-RADS Classification:** {birads}")
-                st.warning(f"**Clinical Action Note:** {clinical_note}")
-            else:
-                st.success(f"**Pathology Classification:** {pathology}")
-                st.success(f"**BI-RADS Classification:** {birads}")
-                st.success(f"**Clinical Action Note:** {clinical_note}")
+                # Extract 768-d Embedding Vector
+                with torch.no_grad():
+                    emb_tensor = extractor(input_tensor)
+                    emb_vector = emb_tensor.squeeze(0).cpu().numpy().tolist()
+                
+                # Extract Physical Radiomics
+                radiomics = RadiomicPhysicsEngine.extract_metrics(input_tensor)
+                
+                # Query Reference Knowledge Bank
+                eval_res = ref_bank.query(emb_vector, radiomics)
+                
+                # Assign Safe Unique Primary Key for Database Insertion
+                unique_scan_id = f"SCAN_{in_patient_id}_{int(time.time())}_{uuid.uuid4().hex[:4]}"
+                saved_path = os.path.join(SCANS_DIR, f"{unique_scan_id}.png")
+                views["Standard"].save(saved_path)
+                
+                # Save to Persistent SQLite Database
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("""INSERT INTO pacs_scans (scan_id, patient_id, clinician_user, risk_score, priority_tier, 
+                                                     birads_classification, pathology_subtype, matched_reference_id, 
+                                                     image_storage_path, embedding_payload) 
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (unique_scan_id, in_patient_id, st.session_state.username, eval_res["probability_pct"],
+                           eval_res["priority"], eval_res["birads"], eval_res["pathology"], 
+                           eval_res["top_match"]["ref_id"], saved_path, json.dumps(emb_vector)))
+                conn.commit()
+                conn.close()
 
-# -------------------------------------------------------------
-# TAB 2: WORKPLACE PRIORITIZATION BOARD
-# -------------------------------------------------------------
-with tab_workplace:
-    st.header("📋 Priority Triage Queue")
-    st.caption("Critical malignancy cases automatically float to the top for immediate specialist review.")
+            st.divider()
+            st.subheader("📊 Definitive Triage Evaluation")
+            
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Calculated Malignancy Risk", f"{eval_res['probability_pct']}%")
+            m2.metric("Triage Priority", eval_res["priority"].split(":")[0])
+            m3.metric("BI-RADS Classification", eval_res["birads"])
+            m4.metric("Diagnostic SLA", eval_res["target_sla"])
+            
+            # Clinical Findings Alert
+            if eval_res["probability_pct"] >= 75.0:
+                st.error(f"**Pathology Evaluation:** {eval_res['pathology']} | **Immediate Action Required:** {eval_res['top_match']['notes']}")
+            elif eval_res["probability_pct"] >= 35.0:
+                st.warning(f"**Pathology Evaluation:** {eval_res['pathology']} | **Audit Recommended:** {eval_res['top_match']['notes']}")
+            else:
+                st.success(f"**Pathology Evaluation:** {eval_res['pathology']} | **Negative Screening:** Routine follow-up.")
+
+            # Side-by-Side Reference Comparison Panel
+            st.subheader("🔗 Closest Matching Benchmark Case from Global Knowledge Bank")
+            col_comp1, col_comp2 = st.columns([1, 1])
+            with col_comp1:
+                st.markdown("**Current Patient Scan**")
+                st.image(views["CLAHE Enhanced"], use_container_width=True)
+            with col_comp2:
+                top_m = eval_res["top_match"]
+                st.markdown(f"**Matched Clinical Reference ({top_m['ref_id']})**")
+                st.info(f"**Dataset Archetype:** {top_m['ref_id']} \n\n"
+                        f"**Confirmed Diagnosis:** {top_m['pathology']} \n\n"
+                        f"**Cosine Correlation:** {top_m['similarity']:.4f} \n\n"
+                        f"**Reference Pathology Manifest:** {top_m['notes']}")
+
+# =========================================================================
+# TAB 2: SPECIALIST TRIAGE WORKLIST (INDEX 0 PRIORITY SORTING)
+# =========================================================================
+with nav_tabs[1]:
+    st.header("📋 Priority Radiology Worklist Queue")
+    st.caption("Dynamic PACS worklist sorted by malignancy risk descending. The highest-risk patients sit permanently at Index 0.")
     
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("""
-        SELECT scan_id AS 'Scan Reference', 
-               patient_id AS 'Patient ID', 
-               uploaded_by AS 'Clinician', 
-               risk_score AS 'Malignancy Risk (%)', 
-               priority AS 'Priority Tier', 
-               pathology_type AS 'Pathology / Cancer Type', 
-               birads_category AS 'BI-RADS Assessment', 
-               timestamp AS 'Ingestion Timestamp' 
-        FROM scans 
-        ORDER BY risk_score DESC, timestamp DESC
+        SELECT scan_id AS 'Scan Reference',
+               patient_id AS 'Patient ID',
+               risk_score AS 'Malignancy Risk (%)',
+               priority_tier AS 'Triage Priority',
+               birads_classification AS 'BI-RADS Category',
+               pathology_subtype AS 'Pathology Class',
+               matched_reference_id AS 'Matched Benchmark Case',
+               confirmed_ground_truth AS 'Ground Truth Verification',
+               ingest_timestamp AS 'Time Logged'
+        FROM pacs_scans
+        ORDER BY risk_score DESC, ingest_timestamp DESC
     """, conn)
     conn.close()
     
     if df.empty:
-        st.info("No active scans found in database. Upload a scan above to populate the queue.")
+        st.info("No active patient records logged in queue. Ingest a scan in Tab 1 to populate the worklist.")
     else:
-        # High Risk Filter Toggle
-        show_urgent_only = st.checkbox("Show Priority 1 Urgent Cases Only")
-        if show_urgent_only:
-            df = df[df["Priority Tier"].str.contains("PRIORITY 1")]
-            
         st.dataframe(
             df,
             column_config={
@@ -233,3 +306,67 @@ with tab_workplace:
             use_container_width=True,
             hide_index=True
         )
+
+# =========================================================================
+# TAB 3: CONTINUOUS ACTIVE LEARNING (CLOSED-LOOP GROUND TRUTH ENGINE)
+# =========================================================================
+with nav_tabs[2]:
+    st.header("🧠 Continuous Knowledge Expansion & Active Learning")
+    st.caption("When a biopsy result or senior radiologist confirms an outcome, verify the case below. The system converts it into a permanent benchmark archetype.")
+    
+    conn = sqlite3.connect(DB_PATH)
+    pending_df = pd.read_sql_query("SELECT scan_id, patient_id, risk_score, confirmed_ground_truth FROM pacs_scans ORDER BY ingest_timestamp DESC", conn)
+    conn.close()
+    
+    if pending_df.empty:
+        st.info("No scans available for active memory updates.")
+    else:
+        selected_scan_id = st.selectbox("Select Case to Verify Ground Truth:", pending_df["scan_id"].tolist())
+        
+        col_act1, col_act2 = st.columns(2)
+        with col_act1:
+            if st.button("✅ Confirm Ground Truth as BENIGN", use_container_width=True):
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("""UPDATE pacs_scans 
+                             SET confirmed_ground_truth = 'BENIGN', 
+                                 risk_score = 2.50, 
+                                 priority_tier = '🟢 PRIORITY 3: ROUTINE BENIGN / NORMAL',
+                                 birads_classification = 'BI-RADS 1-2 (Benign Confirmed)'
+                             WHERE scan_id = ?""", (selected_scan_id,))
+                
+                # Fetch embedding to immediately inject into active memory
+                c.execute("SELECT embedding_payload FROM pacs_scans WHERE scan_id = ?", (selected_scan_id,))
+                row = c.fetchone()
+                conn.commit()
+                conn.close()
+                
+                if row:
+                    vec = json.loads(row[0])
+                    ref_bank.register_case(selected_scan_id, vec, "BENIGN", "Normal/Benign Confirmed", "BI-RADS 1", "Verified via Specialist Review")
+                
+                st.success(f"Scan {selected_scan_id} committed as verified BENIGN. Knowledge base updated!")
+                st.rerun()
+                
+        with col_act2:
+            if st.button("🚨 Confirm Ground Truth as MALIGNANT", use_container_width=True):
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("""UPDATE pacs_scans 
+                             SET confirmed_ground_truth = 'MALIGNANT', 
+                                 risk_score = 97.50, 
+                                 priority_tier = '🔴 PRIORITY 1: DEFINITIVE MALIGNANCY (URGENT)',
+                                 birads_classification = 'BI-RADS 5 (Biopsy Proven Malignant)'
+                             WHERE scan_id = ?""", (selected_scan_id,))
+                
+                c.execute("SELECT embedding_payload FROM pacs_scans WHERE scan_id = ?", (selected_scan_id,))
+                row = c.fetchone()
+                conn.commit()
+                conn.close()
+                
+                if row:
+                    vec = json.loads(row[0])
+                    ref_bank.register_case(selected_scan_id, vec, "MALIGNANT", "Biopsy Confirmed Carcinoma", "BI-RADS 5", "Verified via Histopathology")
+                
+                st.success(f"Scan {selected_scan_id} committed as verified MALIGNANT. Knowledge base updated!")
+                st.rerun()
