@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-import numpy as np  # <--- MAKE SURE THIS LINE IS HERE
 
 class FocalLoss(nn.Module):
     """ Penalizes easy negatives to reduce high false-positive spikes """
@@ -62,10 +61,14 @@ class CalibratedInferenceEngine:
     def predict(self, input_tensor):
         self.model.eval()
         with torch.no_grad():
-            raw_logit = self.model(input_tensor).item()
+            # Safely extract the logit even if shape is [1, 1]
+            raw_logit = self.model(input_tensor).view(-1)[0].item()
+            
             # Calibrated Logit transformation
             calibrated_logit = (self.platt_a * raw_logit) + self.platt_b
-            calibrated_prob = 1.0 / (1.0 + np.exp(-calibrated_logit))
+            
+            # Pure PyTorch calculation (Removes NumPy dependency entirely)
+            calibrated_prob = torch.sigmoid(torch.tensor(calibrated_logit, dtype=torch.float32)).item()
             
             # Clinical Priority Tiering Rules
             if calibrated_prob >= 0.85:
@@ -79,7 +82,7 @@ class CalibratedInferenceEngine:
                 sla = "Standard Queue"
                 
             return {
-                "calibrated_probability": round(float(calibrated_prob), 4),
+                "calibrated_probability": round(calibrated_prob, 4),
                 "priority_code": priority,
                 "target_sla": sla
             }
