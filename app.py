@@ -1,172 +1,235 @@
 import streamlit as st
-import os
 import sqlite3
 import torch
-import hashlib
+import torchvision.transforms as transforms
 from PIL import Image
+import os
+import time
+import uuid
+import pandas as pd
+import hashlib
 
-# Import local backend modules
 from model_architecture import DualBackboneOncoGuard, CalibratedInferenceEngine
-from dataset_streamer import ShardedMammographyStreamer
 
-# ==========================================
-# 1. PAGE & DATABASE CONFIGURATION
-# ==========================================
-st.set_page_config(page_title="OncoGuard AI Platform", layout="wide", page_icon="🎗️")
+# Page Layout Setup
+st.set_page_config(page_title="OncoGuard AI - Medical Triage Workspace", layout="wide", page_icon="🩺")
 
+# System Paths & Constants
 BASE_DIR = os.getcwd()
 DB_PATH = os.path.join(BASE_DIR, "system_records.db")
 SCANS_DIR = os.path.join(BASE_DIR, "patient_scans")
 os.makedirs(SCANS_DIR, exist_ok=True)
 
+# Hash password helper
+def hash_pass(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+# Database Initialization with Explicit Schema Safeguards
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (username TEXT PRIMARY KEY, password TEXT, role TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS scans 
-                 (scan_id TEXT PRIMARY KEY, patient_id TEXT, uploader TEXT, 
-                  risk_score REAL, priority TEXT, image_path TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     
-    # Seed default admin
-    pwd_hash = hashlib.sha256("admin123".encode()).hexdigest()
-    c.execute("INSERT OR IGNORE INTO users VALUES ('admin', ?, 'Admin')", (pwd_hash,))
+    # Users Table
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY, 
+                    password TEXT NOT NULL, 
+                    role TEXT NOT NULL)''')
+    
+    # Scans Table
+    c.execute('''CREATE TABLE IF NOT EXISTS scans (
+                    scan_id TEXT PRIMARY KEY, 
+                    patient_id TEXT NOT NULL, 
+                    uploaded_by TEXT NOT NULL, 
+                    risk_score REAL NOT NULL, 
+                    priority TEXT NOT NULL, 
+                    pathology_type TEXT NOT NULL, 
+                    birads_category TEXT NOT NULL, 
+                    file_path TEXT NOT NULL, 
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                    
+    # Default Admin User
+    admin_hash = hash_pass("admin123")
+    c.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES ('admin', ?, 'Admin')", (admin_hash,))
+    
     conn.commit()
     conn.close()
 
 init_db()
 
+# Model Architecture Loader
 @st.cache_resource
-def load_engine():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def load_oncology_engine():
     model = DualBackboneOncoGuard(pretrained=True)
-    model.to(device)
-    model.eval()
-    return CalibratedInferenceEngine(model, platt_a=1.12, platt_b=-0.45), device
+    engine = CalibratedInferenceEngine(model=model)
+    return engine
 
-# ==========================================
-# 2. AUTHENTICATION & SESSION STATE
-# ==========================================
+engine = load_oncology_engine()
+
+# Transform Pipeline for Mammogram Ingestion
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Authentication Session State
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
-    st.session_state.username = ""
-    st.session_state.role = ""
+    st.session_state.username = None
 
-st.sidebar.title("🎗️ OncoGuard AI")
-
+# Authentication Gateway
 if not st.session_state.authenticated:
-    st.subheader("Clinician Portal Login")
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
-    if st.button("Login"):
-        pwd_hash = hashlib.sha256(p.encode()).hexdigest()
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT role FROM users WHERE username=? AND password=?", (u, pwd_hash))
-        res = c.fetchone()
-        conn.close()
-        if res:
-            st.session_state.authenticated = True
-            st.session_state.username = u
-            st.session_state.role = res[0]
-            st.rerun()
-        else:
-            st.error("Invalid credentials.")
-else:
-    st.sidebar.write(f"Logged in: **{st.session_state.username}** ({st.session_state.role})")
-    if st.sidebar.button("Logout"):
+    st.title("🩺 OncoGuard Enterprise Clinical Portal")
+    st.subheader("Secure Oncology Diagnostic Terminal")
+    
+    with st.form("login_form"):
+        username = st.text_input("Clinician Username")
+        password = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Authenticate")
+        
+        if submit:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT password FROM users WHERE username = ?", (username,))
+            row = c.fetchone()
+            conn.close()
+            
+            if row and row[0] == hash_pass(password):
+                st.session_state.authenticated = True
+                st.session_state.username = username
+                st.success("Authenticated successfully.")
+                st.rerun()
+            else:
+                st.error("Invalid credentials. (Default: admin / admin123)")
+    st.stop()
+
+# Header Toolbar
+col_title, col_user = st.columns([4, 1])
+with col_title:
+    st.title("🎗️ OncoGuard AI Workspace")
+    st.caption("Deep Learning Mammography Triage & Pathology Prioritization System")
+with col_user:
+    st.write(f"Logged in: **{st.session_state.username}**")
+    if st.button("Log Out"):
         st.session_state.authenticated = False
         st.rerun()
 
-    menu = ["Worklist Prioritization", "Submit Scan for Testing"]
-    if st.session_state.role == "Admin":
-        menu.append("User Management")
+st.divider()
+
+# Navigation Tabs
+tab_scan, tab_workplace = st.tabs(["🔬 Run Scan Diagnostic", "📋 Workplace Prioritization Board"])
+
+# -------------------------------------------------------------
+# TAB 1: RUN SCAN DIAGNOSTIC
+# -------------------------------------------------------------
+with tab_scan:
+    st.header("New Patient Diagnostic Ingestion")
     
-    choice = st.sidebar.selectbox("Navigation", menu)
-
-    # ----------------------------------------------------
-    # TRIAGE WORKLIST (INDEX 0 PRIORITY SORTING)
-    # ----------------------------------------------------
-    if choice == "Worklist Prioritization":
-        st.header("📋 Specialist Worklist Queue (AI Priority Sorted)")
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT patient_id, risk_score, priority, timestamp FROM scans ORDER BY risk_score DESC")
-        scans = c.fetchall()
-        conn.close()
-
-        if not scans:
-            st.info("No active patient scans in queue.")
+    col_input, col_preview = st.columns([1, 1])
+    
+    with col_input:
+        patient_id = st.text_input("Patient Reference ID", placeholder="e.g. PT-90821")
+        uploaded_file = st.file_uploader("Upload Digital Mammogram (JPG / PNG)", type=["jpg", "png", "jpeg"])
+        run_btn = st.button("🚀 Execute Clinical Analysis", use_container_width=True)
+    
+    if run_btn:
+        if not patient_id or not uploaded_file:
+            st.warning("Please provide both a Patient Reference ID and a valid DICOM/Image scan.")
         else:
-            for patient_id, risk, priority, ts in scans:
-                if risk >= 85.0:
-                    st.error(f"🔴 **PATIENT: {patient_id}** | Malignancy Risk: {risk:.2f}% | Priority: {priority} | Time: {ts}")
-                elif risk >= 35.0:
-                    st.warning(f"🟡 **PATIENT: {patient_id}** | Malignancy Risk: {risk:.2f}% | Priority: {priority} | Time: {ts}")
-                else:
-                    st.success(f"🟢 **PATIENT: {patient_id}** | Malignancy Risk: {risk:.2f}% | Priority: {priority} | Time: {ts}")
-
-    # ----------------------------------------------------
-    # SUBMIT SCAN FOR INFERENCE
-    # ----------------------------------------------------
-    elif choice == "Submit Scan for Testing":
-        st.header("📤 Upload Patient Mammogram")
-        patient_id = st.text_input("Patient ID / Record Number")
-        uploaded_file = st.file_uploader("Select Mammogram Image", type=["png", "jpg", "jpeg", "dcm"])
-
-        if uploaded_file and patient_id:
-            if st.button("Run AI Diagnostics & Route Case"):
-                image = Image.open(uploaded_file).convert("RGB")
-                st.image(image, caption=f"Scan for Patient {patient_id}", width=300)
-                
-                engine, device = load_engine()
-                streamer = ShardedMammographyStreamer([])
-                
-                # Preprocess via CLAHE
-                bytes_data = uploaded_file.getvalue()
-                pil_img = streamer.preprocess_clahe(bytes_data)
-                
-                if pil_img is None:
-                    pil_img = image
-
-                input_tensor = streamer.default_transform()(pil_img).unsqueeze(0).to(device)
+            # Generate Unique Storage Path & Unique Primary Key
+            unique_scan_id = f"SCAN_{patient_id}_{int(time.time())}_{uuid.uuid4().hex[:4]}"
+            file_path = os.path.join(SCANS_DIR, f"{unique_scan_id}.png")
+            
+            # Save Image Locally
+            image = Image.open(uploaded_file).convert("RGB")
+            image.save(file_path)
+            
+            with col_preview:
+                st.image(image, caption=f"Uploaded Scan: {patient_id}", use_column_width=True)
+            
+            # Run Inference Pipeline
+            with st.spinner("Processing Dual-Backbone Feature Extractor & Platt Calibration..."):
+                input_tensor = transform(image).unsqueeze(0)
                 result = engine.predict(input_tensor)
                 
-                risk_pct = round(result["calibrated_probability"] * 100, 2)
-                priority = result["priority_code"]
+            risk_pct = result["calibrated_probability"]
+            priority = result["priority_code"]
+            sla = result["target_sla"]
+            birads = result["birads_category"]
+            pathology = result["pathology_type"]
+            clinical_note = result["clinical_note"]
+            
+            # Safe Database Insertion with Unique ID & Explicit Columns
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("""INSERT INTO scans (scan_id, patient_id, uploaded_by, risk_score, priority, pathology_type, birads_category, file_path) 
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                      (unique_scan_id, patient_id, st.session_state.username, risk_pct, priority, pathology, birads, file_path))
+            conn.commit()
+            conn.close()
+            
+            # Display Clinical Results Card
+            st.divider()
+            st.subheader("📊 AI Diagnostic Output")
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Malignancy Risk", f"{risk_pct}%")
+            m2.metric("Triage Priority Tier", priority.split(":")[0])
+            m3.metric("Target Clinical SLA", sla)
+            
+            if "DEFINITIVE MALIGNANCY" in priority:
+                st.error(f"**Pathology Classification:** {pathology}")
+                st.error(f"**BI-RADS Classification:** {birads}")
+                st.error(f"**Clinical Action Note:** {clinical_note}")
+            elif "SUSPICIOUS" in priority:
+                st.warning(f"**Pathology Classification:** {pathology}")
+                st.warning(f"**BI-RADS Classification:** {birads}")
+                st.warning(f"**Clinical Action Note:** {clinical_note}")
+            else:
+                st.success(f"**Pathology Classification:** {pathology}")
+                st.success(f"**BI-RADS Classification:** {birads}")
+                st.success(f"**Clinical Action Note:** {clinical_note}")
 
-                # Save file locally
-                file_path = os.path.join(SCANS_DIR, f"{patient_id}_{uploaded_file.name}")
-                image.save(file_path)
-
-                # Insert into DB
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("INSERT INTO scans VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                          (f"SCAN_{patient_id}", patient_id, st.session_state.username, risk_pct, priority, file_path))
-                conn.commit()
-                conn.close()
-
-                st.success(f"Analysis Complete! Risk Score: {risk_pct}% | Status: {priority}")
-
-    # ----------------------------------------------------
-    # USER MANAGEMENT
-    # ----------------------------------------------------
-    elif choice == "User Management" and st.session_state.role == "Admin":
-        st.header("👤 Manage System Users")
-        nu = st.text_input("New Username")
-        np_pass = st.text_input("New Password", type="password")
-        nr = st.selectbox("Role", ["Doctor", "Patient", "Admin"])
-
-        if st.button("Create Login Account"):
-            if nu and np_pass:
-                pwd_hash = hashlib.sha256(np_pass.encode()).hexdigest()
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                try:
-                    c.execute("INSERT INTO users VALUES (?, ?, ?)", (nu, pwd_hash, nr))
-                    conn.commit()
-                    st.success(f"Account for '{nu}' created.")
-                except sqlite3.IntegrityError:
-                    st.error("Username already exists.")
-                conn.close()
+# -------------------------------------------------------------
+# TAB 2: WORKPLACE PRIORITIZATION BOARD
+# -------------------------------------------------------------
+with tab_workplace:
+    st.header("📋 Priority Triage Queue")
+    st.caption("Critical malignancy cases automatically float to the top for immediate specialist review.")
+    
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("""
+        SELECT scan_id AS 'Scan Reference', 
+               patient_id AS 'Patient ID', 
+               uploaded_by AS 'Clinician', 
+               risk_score AS 'Malignancy Risk (%)', 
+               priority AS 'Priority Tier', 
+               pathology_type AS 'Pathology / Cancer Type', 
+               birads_category AS 'BI-RADS Assessment', 
+               timestamp AS 'Ingestion Timestamp' 
+        FROM scans 
+        ORDER BY risk_score DESC, timestamp DESC
+    """, conn)
+    conn.close()
+    
+    if df.empty:
+        st.info("No active scans found in database. Upload a scan above to populate the queue.")
+    else:
+        # High Risk Filter Toggle
+        show_urgent_only = st.checkbox("Show Priority 1 Urgent Cases Only")
+        if show_urgent_only:
+            df = df[df["Priority Tier"].str.contains("PRIORITY 1")]
+            
+        st.dataframe(
+            df,
+            column_config={
+                "Malignancy Risk (%)": st.column_config.ProgressColumn(
+                    "Malignancy Risk (%)",
+                    format="%.2f%%",
+                    min_value=0,
+                    max_value=100,
+                ),
+            },
+            use_container_width=True,
+            hide_index=True
+        )
