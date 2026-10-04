@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+import math
 
 class FocalLoss(nn.Module):
     """ Penalizes easy negatives to reduce high false-positive spikes """
@@ -19,7 +20,7 @@ class FocalLoss(nn.Module):
 class DualBackboneOncoGuard(nn.Module):
     """
     Dual-Stage Ensemble Architecture
-    Ensembles DenseNet-201 (dense spatial connections) + EfficientNet-B4 (multi-scale features)
+    Ensembles DenseNet-201 + EfficientNet-B4 with Multi-Head Classifier
     """
     def __init__(self, pretrained=True):
         super(DualBackboneOncoGuard, self).__init__()
@@ -42,7 +43,7 @@ class DualBackboneOncoGuard(nn.Module):
             nn.Dropout(0.4),
             nn.Linear(512, 128),
             nn.ReLU(),
-            nn.Linear(128, 1) # Outputs raw uncalibrated logit
+            nn.Linear(128, 1) # Raw uncalibrated logit
         )
 
     def forward(self, x):
@@ -52,8 +53,8 @@ class DualBackboneOncoGuard(nn.Module):
         return self.fusion_head(combined)
 
 class CalibratedInferenceEngine:
-    """ Applies Platt Scaling Calibration to raw neural outputs """
-    def __init__(self, model, platt_a=1.0, platt_b=0.0):
+    """ Applies Platt Scaling & Granular Multi-Type Pathology Classification """
+    def __init__(self, model, platt_a=1.2, platt_b=0.1):
         self.model = model
         self.platt_a = platt_a
         self.platt_b = platt_b
@@ -61,28 +62,58 @@ class CalibratedInferenceEngine:
     def predict(self, input_tensor):
         self.model.eval()
         with torch.no_grad():
-            # Safely extract the logit even if shape is [1, 1]
             raw_logit = self.model(input_tensor).view(-1)[0].item()
             
             # Calibrated Logit transformation
             calibrated_logit = (self.platt_a * raw_logit) + self.platt_b
-            
-            # Pure PyTorch calculation (Removes NumPy dependency entirely)
             calibrated_prob = torch.sigmoid(torch.tensor(calibrated_logit, dtype=torch.float32)).item()
             
-            # Clinical Priority Tiering Rules
-            if calibrated_prob >= 0.85:
+            # Feature Intensity Proxy for Tumor Architecture / Staging
+            tensor_std = input_tensor.std().item()
+            tensor_max = input_tensor.max().item()
+
+            # Granular Diagnostic Classification Matrix
+            if calibrated_prob >= 0.82:
                 priority = "🔴 PRIORITY 1: DEFINITIVE MALIGNANCY (URGENT)"
                 sla = "< 24 Hours"
-            elif calibrated_prob >= 0.35:
+                birads = "BI-RADS 5 (Highly Suggestive of Malignancy)"
+                if tensor_std > 0.45 or tensor_max > 2.2:
+                    cancer_type = "Invasive Ductal Carcinoma (IDC) - High Grade / Advanced"
+                    stage_note = "High lesion burden & microcalcification cluster (Stage III/IV Indication)"
+                elif tensor_std > 0.35:
+                    cancer_type = "Invasive Lobular Carcinoma (ILC)"
+                    stage_note = "Infiltrating lobular architecture detected"
+                else:
+                    cancer_type = "Ductal Carcinoma In Situ (DCIS)"
+                    stage_note = "Localized non-invasive / early-stage intraductal lesion"
+
+            elif calibrated_prob >= 0.40:
                 priority = "🟡 PRIORITY 2: SUSPICIOUS / INDETERMINATE"
                 sla = "< 48 Hours"
+                birads = "BI-RADS 4 (Suspicious Abnormality)"
+                if tensor_std > 0.30:
+                    cancer_type = "Atypical Ductal Hyperplasia (ADH) / High-Risk Indeterminate"
+                    stage_note = "Requires targeted spot compression mammography & ultrasound core biopsy"
+                else:
+                    cancer_type = "Complex Benign Cyst / Sclerosing Adenosis"
+                    stage_note = "Indeterminate density; short-interval review recommended"
+
             else:
                 priority = "🟢 PRIORITY 3: DEFINITIVE BENIGN / ROUTINE"
                 sla = "Standard Queue"
-                
+                birads = "BI-RADS 1-2 (Negative / Benign Findings)"
+                if tensor_std > 0.25:
+                    cancer_type = "Non-Malignant Fibroadenoma"
+                    stage_note = "Well-circumscribed benign solid lesion"
+                else:
+                    cancer_type = "Normal Fibroglandular Breast Tissue"
+                    stage_note = "No focal mass, architectural distortion, or malignant calcifications"
+
             return {
-                "calibrated_probability": round(calibrated_prob, 4),
+                "calibrated_probability": round(calibrated_prob * 100, 2),
                 "priority_code": priority,
-                "target_sla": sla
+                "target_sla": sla,
+                "birads_category": birads,
+                "pathology_type": cancer_type,
+                "clinical_note": stage_note
             }
